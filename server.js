@@ -6,13 +6,14 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// ✅ ЗБІЛЬШЕНО ЛІМІТ ДЛЯ ЗАПИТІВ (виправляє помилку 413)
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 // NVIDIA NIM API configuration
-const NIM_API_BASE = process.env.NIM_API_BASE || 'https://ai.api.nvidia.com/v1';
-const NIM_API_KEY = process.env.NIM_API_KEY;
+const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
+const NIM_API_KEY = process.env.NVIDIA_NIM_API_KEY || process.env.NIM_API_KEY;
 
 // 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
 const SHOW_REASONING = false; // Set to true to show reasoning with <think> tags
@@ -28,7 +29,11 @@ const MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v3.1',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking' 
+  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking',
+  // Додаємо прямі назви моделей, які використовуєте
+  'deepseek-ai/deepseek-v4-flash': 'deepseek-ai/deepseek-v4-flash',
+  'deepseek-ai/deepseek-r1': 'deepseek-ai/deepseek-r1',
+  'meta/llama3-70b-instruct': 'meta/llama3-70b-instruct'
 };
 
 // Health check endpoint
@@ -61,34 +66,28 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
+    console.log(`📩 Отримано запит для моделі: ${model}`);
+    console.log(`📝 Кількість повідомлень: ${messages?.length || 0}`);
+    
+    // Перевірка наявності API ключа
+    if (!NIM_API_KEY) {
+      console.error('❌ API ключ не знайдено! Додайте змінну NVIDIA_NIM_API_KEY');
+      return res.status(500).json({
+        error: {
+          message: 'API key not configured. Please set NVIDIA_NIM_API_KEY environment variable.',
+          type: 'server_error'
+        }
+      });
+    }
+    
     // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model];
     if (!nimModel) {
-      try {
-        await axios.post(`${NIM_API_BASE}/chat/completions`, {
-          model: model,
-          messages: [{ role: 'user', content: 'test' }],
-          max_tokens: 1
-        }, {
-          headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
-          validateStatus: (status) => status < 500
-        }).then(res => {
-          if (res.status >= 200 && res.status < 300) {
-            nimModel = model;
-          }
-        });
-      } catch (e) {}
-      
-      if (!nimModel) {
-        const modelLower = model.toLowerCase();
-        if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
-          nimModel = 'meta/llama-3.1-405b-instruct';
-        } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
-          nimModel = 'meta/llama-3.1-70b-instruct';
-        } else {
-          nimModel = 'meta/llama-3.1-8b-instruct';
-        }
-      }
+      // Якщо модель не знайдена в мапінгу, пробуємо використати її як є
+      nimModel = model;
+      console.log(`🔄 Використовуємо модель як є: ${nimModel}`);
+    } else {
+      console.log(`🔄 Мапінг моделі: ${model} -> ${nimModel}`);
     }
     
     // Transform OpenAI request to NIM format
@@ -97,9 +96,15 @@ app.post('/v1/chat/completions', async (req, res) => {
       messages: messages,
       temperature: temperature || 0.6,
       max_tokens: max_tokens || 9024,
-      extra_body: ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined,
       stream: stream || false
     };
+    
+    // Додаємо extra_body тільки якщо потрібно
+    if (ENABLE_THINKING_MODE) {
+      nimRequest.extra_body = { chat_template_kwargs: { thinking: true } };
+    }
+    
+    console.log(`🚀 Надсилаємо запит до NVIDIA NIM...`);
     
     // Make request to NVIDIA NIM API
     const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
@@ -107,6 +112,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         'Authorization': `Bearer ${NIM_API_KEY}`,
         'Content-Type': 'application/json'
       },
+      timeout: 120000, // 120 секунд таймаут
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
       responseType: stream ? 'stream' : 'json'
     });
     
@@ -159,6 +167,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     delete data.choices[0].delta.reasoning_content;
                   }
                 } else {
+                  // Якщо reasoning вимкнено, показуємо тільки контент
                   if (content) {
                     data.choices[0].delta.content = content;
                   } else {
@@ -175,9 +184,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
       });
       
-      response.data.on('end', () => res.end());
+      response.data.on('end', () => {
+        console.log('✅ Потік завершено');
+        res.end();
+      });
       response.data.on('error', (err) => {
-        console.error('Stream error:', err);
+        console.error('❌ Помилка потоку:', err.message);
         res.end();
       });
     } else {
@@ -210,11 +222,18 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       };
       
+      console.log('✅ Відповідь надіслано');
       res.json(openaiResponse);
     }
     
   } catch (error) {
-    console.error('Proxy error:', error.message);
+    console.error('❌ Помилка проксі:', error.message);
+    
+    // Детальніше про помилку
+    if (error.response) {
+      console.error('📡 Статус відповіді:', error.response.status);
+      console.error('📡 Дані помилки:', JSON.stringify(error.response.data, null, 2));
+    }
     
     res.status(error.response?.status || 500).json({
       error: {
@@ -238,8 +257,9 @@ app.all('*', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`🚀 OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
+  console.log(`🏥 Health check: http://localhost:${PORT}/health`);
+  console.log(`🧠 Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`💭 Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`📦 Ліміт розміру запиту: 100mb`);
 });
